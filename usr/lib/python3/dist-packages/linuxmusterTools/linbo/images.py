@@ -12,6 +12,7 @@ from configobj import ConfigObjError
 from ..common.checks import NameChecker
 from ..lmnfile import LMNFile
 from .drivers import (
+    DriverProfileAssignedError,
     IMAGE_CONF_FILENAME,
     LinboDriverManager,
     _mutation_lock,
@@ -66,6 +67,16 @@ name_checker = NameChecker()
 
 class DriverPostsyncOwnershipError(RuntimeError):
     """Raised when an existing driver hook is not owned by this manager."""
+
+
+def _ignore_duplicate_files(_directory, names):
+    """Do not clone backups or per-image driver dispatchers."""
+
+    return [
+        name
+        for name in names
+        if name in {"backup", "backups"} or name.endswith(DRIVERPOSTSYNC_SUFFIX)
+    ]
 
 def date2timestamp(date):
     return datetime.strptime(date, DATE_UI_FMT).strftime(TIMESTAMP_FMT)
@@ -781,6 +792,26 @@ class LinboImageManager:
                 raise
         return {"profile": profile["name"], "image": None}
 
+    def _delete_whole_image_group(self, group):
+        """Delete an unassigned image group and its managed dispatcher."""
+
+        self.driver_manager._ensure_base_directory()
+        with _mutation_lock(self.driver_manager.base):
+            profiles = self._assigned_driver_profiles(group)
+            if profiles:
+                raise DriverProfileAssignedError(profiles[0], group)
+            hook = self._snapshot_driverpostsync(group)
+            hook_path = self._driverpostsync_path(group)
+            if hook is not None:
+                hook_path.unlink()
+            try:
+                self.groups[group].delete()
+            except Exception:
+                if hook is not None and hook_path.parent.is_dir():
+                    self._restore_snapshot(hook_path, hook)
+                raise
+        del self.groups[group]
+
     def list(self):
         """
         Browse LINBO_PATH to discover all linbo images.
@@ -809,6 +840,10 @@ class LinboImageManager:
         """
 
         if group in self.groups:
+            # Apply assignment guards before the separate backup/diff paths.
+            if not date and not diff:
+                self._delete_whole_image_group(group)
+                return
             if diff:
                 # Only delete a differential image
                 self.groups[group].diff_image.delete()
@@ -817,9 +852,7 @@ class LinboImageManager:
                 self.groups[group].backups[date].delete()
                 self.groups[group].load()
             else:
-                # Then delete the whole group
-                self.groups[group].delete()
-                del self.groups[group]
+                self._delete_whole_image_group(group)
 
     def rename(self, group, new_name):
         """
@@ -832,9 +865,45 @@ class LinboImageManager:
         """
 
         if group in self.groups:
-            self.groups[group].rename(new_name)
-            self.groups[new_name] = LinboImageGroup(new_name)
-            del self.groups[group]
+            self.driver_manager._ensure_base_directory()
+            with _mutation_lock(self.driver_manager.base):
+                profiles = self._assigned_driver_profiles(group)
+                if profiles:
+                    raise DriverProfileAssignedError(profiles[0], group)
+                hook = self._snapshot_driverpostsync(group)
+                old_hook_path = self._driverpostsync_path(group)
+                staged_hook_path = None
+                if hook is not None:
+                    self._validated_driver_image(new_name)
+                    staged_hook_path = Path(
+                        self.groups[group].path,
+                        f"{new_name}{DRIVERPOSTSYNC_SUFFIX}",
+                    )
+                    if os.path.lexists(staged_hook_path):
+                        raise DriverPostsyncOwnershipError(
+                            "Refusing to replace an existing staged driver "
+                            f"postsync: {staged_hook_path}"
+                        )
+                    content = self._render_driverpostsync(
+                        new_name, []
+                    ).encode("utf-8")
+                    self._atomic_replace(staged_hook_path, content, 0o755)
+                try:
+                    if hook is not None:
+                        old_hook_path.unlink()
+                    self.groups[group].rename(new_name)
+                except Exception:
+                    if old_hook_path.parent.is_dir():
+                        if staged_hook_path is not None:
+                            try:
+                                staged_hook_path.unlink()
+                            except FileNotFoundError:
+                                pass
+                        if hook is not None:
+                            self._restore_snapshot(old_hook_path, hook)
+                    raise
+                self.groups[new_name] = LinboImageGroup(new_name)
+                del self.groups[group]
 
     def duplicate(self, group, new_name):
         """
@@ -854,7 +923,7 @@ class LinboImageManager:
             shutil.copytree(
                 os.path.join(LINBO_PATH, group),
                 os.path.join(LINBO_PATH, new_name),
-                ignore=lambda x,y: 'backups'
+                ignore=_ignore_duplicate_files,
             )
 
             old_prefix = f'{group}.'
@@ -899,12 +968,16 @@ class LinboImageManager:
                 # Move base image to backup/timestamp
                 for file in os.listdir(imageGroup.base.path):
                     # Avoid copying backups dir in itself
+                    if file.endswith(DRIVERPOSTSYNC_SUFFIX):
+                        continue
                     if os.path.isfile(os.path.join(imageGroup.base.path, file)):
                         shutil.move(os.path.join(imageGroup.base.path, file),
                                 new_backup_dir)
 
                 # Move backup to base image
                 for file in os.listdir(imageGroup.backups[date].path):
+                    if file.endswith(DRIVERPOSTSYNC_SUFFIX):
+                        continue
                     shutil.move(os.path.join(imageGroup.backups[date].path, file),
                                 imageGroup.base.path)
 

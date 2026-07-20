@@ -69,6 +69,11 @@ assignment keeps a cleanup dispatcher so a client can discard stale state.
 dispatchers from the `image.conf` assignments. It also migrates dispatchers
 with an exact known legacy ownership header and leaves unrelated hooks alone.
 
+The image-lifecycle integration prevents assigned images from being renamed
+or deleted. It keeps managed dispatchers with their image during rename,
+excludes them from duplicates and preserves the current dispatcher during a
+backup restore. Foreign dispatcher files are never overwritten.
+
 The dispatcher contains no matching or transfer implementation. It only calls
 the static `linbo_driverpostsync` command with the image and profile names.
 Roll out the corresponding LINBO client-filesystem command before assigning

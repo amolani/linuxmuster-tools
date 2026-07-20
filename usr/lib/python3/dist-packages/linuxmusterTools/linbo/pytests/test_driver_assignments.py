@@ -401,6 +401,169 @@ def test_assigned_profile_cannot_be_deleted(environment):
         drivers.delete_profile("model")
 
 
+def test_assigned_image_rename_and_delete_are_guarded(environment):
+    drivers, images, root = environment("win11")
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "win11")
+
+    with pytest.raises(DriverProfileAssignedError):
+        images.rename("win11", "renamed")
+    with pytest.raises(DriverProfileAssignedError):
+        images.delete("win11")
+
+    assert "win11" in images.groups
+    assert (root / "win11/win11.qcow2").exists()
+
+
+def test_malformed_profile_blocks_image_delete(environment):
+    drivers, images, root = environment("win11")
+    profile = _profile(drivers, "broken")
+    Path(profile["path"], "match.conf").write_text("invalid = true\n")
+    Path(profile["path"], "image.conf").write_text("[image]\nname = win11\n")
+
+    with pytest.raises(ValueError):
+        images.delete("win11")
+
+    assert (root / "win11/win11.qcow2").exists()
+
+
+def test_duplicate_does_not_copy_dispatcher_or_assignment(environment):
+    drivers, images, root = environment("source")
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "source")
+
+    images.duplicate("source", "clone")
+
+    assert (root / "clone/clone.qcow2").exists()
+    assert not list((root / "clone").glob("*.driverpostsync"))
+    assert images.get_driver_profile_image("model") == "source"
+
+
+def test_restore_preserves_the_current_dispatcher(environment):
+    drivers, images, root = environment("win11")
+    _create_image(root, "win11", backup="202607190800", payload=b"backup")
+    images.list()
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "win11")
+    hook = root / "win11/win11.driverpostsync"
+    content = hook.read_bytes()
+
+    images.restore("win11", "19/07/2026 08:00")
+
+    assert hook.read_bytes() == content
+    assert (root / "win11/win11.qcow2").read_bytes() == b"backup"
+
+
+def test_unassigned_managed_hook_follows_rename_and_delete(environment):
+    drivers, images, root = environment("win11")
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "win11")
+    images.unassign_driver_profile("model")
+
+    images.rename("win11", "windows")
+
+    hook = root / "windows/windows.driverpostsync"
+    assert 'linbo_driverpostsync "windows"\n' in hook.read_text()
+    assert not (root / "win11").exists()
+
+    images.delete("windows")
+    assert not (root / "windows").exists()
+
+
+def test_rename_publication_failure_leaves_image_and_old_hook_unchanged(
+    environment, monkeypatch
+):
+    drivers, images, root = environment("win11")
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "win11")
+    images.unassign_driver_profile("model")
+    hook = root / "win11/win11.driverpostsync"
+    hook_content = hook.read_bytes()
+
+    def fail_publication(*_args):
+        raise OSError("publication failed")
+
+    monkeypatch.setattr(images, "_atomic_replace", fail_publication)
+
+    with pytest.raises(OSError, match="publication failed"):
+        images.rename("win11", "windows")
+
+    assert (root / "win11/win11.qcow2").exists()
+    assert hook.read_bytes() == hook_content
+    assert not (root / "windows").exists()
+    assert "win11" in images.groups
+
+
+def test_failed_image_rename_restores_old_dispatcher(environment, monkeypatch):
+    drivers, images, root = environment("win11")
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "win11")
+    images.unassign_driver_profile("model")
+    hook = root / "win11/win11.driverpostsync"
+    hook_content = hook.read_bytes()
+
+    def fail_rename(_new_name):
+        raise OSError("rename failed")
+
+    monkeypatch.setattr(images.groups["win11"], "rename", fail_rename)
+
+    with pytest.raises(OSError, match="rename failed"):
+        images.rename("win11", "windows")
+
+    assert hook.read_bytes() == hook_content
+    assert not (root / "win11/windows.driverpostsync").exists()
+    assert (root / "win11/win11.qcow2").exists()
+
+
+def test_failed_image_delete_restores_dispatcher(environment, monkeypatch):
+    drivers, images, root = environment("win11")
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "win11")
+    images.unassign_driver_profile("model")
+    hook = root / "win11/win11.driverpostsync"
+    hook_content = hook.read_bytes()
+
+    def fail_delete():
+        raise OSError("delete failed")
+
+    monkeypatch.setattr(images.groups["win11"], "delete", fail_delete)
+
+    with pytest.raises(OSError, match="delete failed"):
+        images.delete("win11")
+
+    assert hook.read_bytes() == hook_content
+    assert "win11" in images.groups
+
+
+@pytest.mark.parametrize("operation", ["delete", "rename"])
+def test_foreign_dispatcher_blocks_image_lifecycle(environment, operation):
+    _, images, root = environment("win11")
+    hook = root / "win11/win11.driverpostsync"
+    content = "#!/bin/sh\necho keep\n"
+    hook.write_text(content)
+
+    with pytest.raises(DriverPostsyncOwnershipError):
+        if operation == "delete":
+            images.delete("win11")
+        else:
+            images.rename("win11", "windows")
+
+    assert hook.read_text() == content
+    assert (root / "win11/win11.qcow2").exists()
+
+
+def test_managed_hook_prevents_rename_to_runtime_unsupported_name(environment):
+    drivers, images, root = environment("win11")
+    _profile(drivers, "model")
+    images.assign_driver_profile("model", "win11")
+    images.unassign_driver_profile("model")
+
+    with pytest.raises(ValueError, match="only"):
+        images.rename("win11", "win.11")
+
+    assert (root / "win11/win11.driverpostsync").exists()
+
+
 def test_orphan_assignment_can_be_removed(environment):
     drivers, images, _ = environment("win11")
     profile = _profile(drivers, "model")
