@@ -21,7 +21,11 @@ from ..common.checks import NameChecker
 from ..lmnfile import LMNFile
 
 
-__all__ = ["DriverProfileExistsError", "LinboDriverManager"]
+__all__ = [
+    "DriverProfileAssignedError",
+    "DriverProfileExistsError",
+    "LinboDriverManager",
+]
 
 
 logger = logging.getLogger(__name__)
@@ -31,6 +35,7 @@ DEFAULT_DRIVERS_BASE = Path(
     os.environ.get("DRIVERS_BASE", "/srv/linbo/drivers")
 )
 MATCH_CONF_FILENAME = "match.conf"
+IMAGE_CONF_FILENAME = "image.conf"
 MAX_MATCH_VALUE_LENGTH = 512
 MUTATION_LOCK_FILENAME = ".driver-profiles.lock"
 
@@ -53,6 +58,18 @@ class DriverProfileExistsError(FileExistsError):
     def __init__(self, profile):
         super().__init__(f"Driver profile already exists: {profile}")
         self.profile = profile
+
+
+class DriverProfileAssignedError(RuntimeError):
+    """Raised when an assigned profile or image must not be removed."""
+
+    def __init__(self, profile, image=None):
+        message = f"Driver profile is assigned to a LINBO image: {profile}"
+        if image is not None:
+            message = f"Driver profile {profile} is assigned to image {image}."
+        super().__init__(message)
+        self.profile = profile
+        self.image = image
 
 
 def _validated_profile_name(name):
@@ -170,8 +187,8 @@ class LinboDriverManager:
         if is_new:
             path.chmod(0o644)
 
-    def list_profiles(self):
-        """Return every complete, valid profile sorted by name."""
+    def list_profiles(self, strict=False):
+        """Return valid profiles; optionally fail on malformed profile paths."""
 
         if not os.path.lexists(self.base):
             return []
@@ -184,6 +201,8 @@ class LinboDriverManager:
             try:
                 profile = self.get_profile(candidate.name)
             except (OSError, ValueError, ConfigObjError) as error:
+                if strict:
+                    raise
                 logger.warning(
                     "Ignoring invalid driver profile %s: %s",
                     candidate.name,
@@ -333,6 +352,8 @@ class LinboDriverManager:
             if profile is None:
                 return False
             profile_path = Path(profile["path"])
+            if os.path.lexists(profile_path / IMAGE_CONF_FILENAME):
+                raise DriverProfileAssignedError(profile["name"])
             quarantine = self.base / (
                 f".{profile['name']}.deleting-{uuid.uuid4().hex}"
             )

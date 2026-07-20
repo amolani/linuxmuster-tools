@@ -17,11 +17,15 @@ The manager contains a dict of all groups in the attributes `groups`. Each group
 
 ## Windows driver profiles
 
-`LinboDriverManager` manages the metadata for hardware-specific Windows
-driver profiles below `/srv/linbo/drivers`. This first, deliberately small
-interface owns only profile directories and their `match.conf`; inventory,
-image assignments, postsync generation and driver imports are separate
-features.
+`LinboDriverManager` owns hardware-specific Windows driver profiles below
+`/srv/linbo/drivers`. `LinboImageManager` owns their image assignments and
+the generated companion dispatcher below `/srv/linbo/images`.
+
+The files have deliberately narrow roles:
+
+- `drivers/<profile>/match.conf` describes one DMI hardware class.
+- `drivers/<profile>/image.conf` assigns that profile to one image.
+- `images/<image>/<image>.driverpostsync` dispatches the profile list.
 
 Each profile contains exactly one DMI vendor and one product substring:
 
@@ -36,15 +40,44 @@ match exactly and `product` must occur in the client's DMI product name. An
 explicit `*` can be used as a wildcard. A short product such as `21L4` can
 therefore cover multiple variants of the same hardware class.
 
+The assignment is also a canonical LMN config object:
+
+```ini
+[image]
+name = win11
+```
+
+The former standalone package's flat `image = win11` form remains readable
+for upgrades. The next assignment writes the canonical section form.
+
 ```python
-from linuxmusterTools.linbo import LinboDriverManager
+from linuxmusterTools.linbo import LinboDriverManager, LinboImageManager
 
 drivers = LinboDriverManager()
 drivers.create_profile("lenovo-21l4", "LENOVO", "21L4")
 drivers.update_match("lenovo-21l4", "LENOVO", "21L4S")
+
+images = LinboImageManager(driver_manager=drivers)
+images.assign_driver_profile("lenovo-21l4", "win11")
+images.reconcile_driverpostsyncs()
 ```
 
-This creates `/srv/linbo/drivers/lenovo-21l4/match.conf`. Administrators may
-place an already prepared INF driver payload next to that file. Profile
-updates change only `match.conf` and leave those payload files untouched. This
-manager does not upload, extract, inspect or publish the payload yet.
+Many profiles may reference the same image. Every assignment change rebuilds
+one deterministic, sorted dispatcher for that image. Removing the last
+assignment keeps a cleanup dispatcher so a client can discard stale state.
+`reconcile_driverpostsyncs()` repairs missing or manually changed managed
+dispatchers from the `image.conf` assignments. It also migrates dispatchers
+with an exact known legacy ownership header and leaves unrelated hooks alone.
+
+The dispatcher contains no matching or transfer implementation. It only calls
+the static `linbo_driverpostsync` command with the image and profile names.
+Roll out the corresponding LINBO client-filesystem command before assigning
+profiles; otherwise the generated command guard reports the missing runtime.
+
+Administrators place prepared INF driver payloads next to `match.conf`.
+Profile updates preserve these files. Uploading, extracting and inspecting
+payload archives are intentionally outside this interface.
+
+`LMNFile` can leave hidden `.match.conf.bak.*` and `.image.conf.bak.*`
+metadata on updates. The LINBO runtime packaging change must exclude those
+server-side backups from transferred driver payloads.
